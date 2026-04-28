@@ -1,5 +1,7 @@
 # tensor_parallel
 
+[中文版](README_zh.md)
+
 A toy implementation of Tensor Parallel (TP) + Sequence Parallel (SP) with comm-compute overlap.
 
 ## Quick Start
