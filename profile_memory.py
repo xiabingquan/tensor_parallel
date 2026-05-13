@@ -11,15 +11,16 @@ from config import ModelConfig
 from initialize import init_distributed, set_seed, get_tp_world_size
 from model import Transformer
 
-TP_SIZE = 4
+TP_SIZE = 8
 NUM_STEPS = 100
+WARMUP_STEPS = 10
 
 MODEL_KWARGS = dict(
-    hidden_size=512,
+    hidden_size=4096,
     num_attention_heads=8,
-    intermediate_size=1024,
+    intermediate_size=11008,
     num_layers=4,
-    sequence_length=256,
+    sequence_length=8192,
     batch_size=4,
 )
 
@@ -75,7 +76,7 @@ def _profile_worker(
 
     stats: list[dict] = []
 
-    for step in range(NUM_STEPS):
+    for step in range(NUM_STEPS + WARMUP_STEPS):
         torch.cuda.reset_peak_memory_stats()
         x = torch.randn(
             sp_seq_len,
@@ -101,6 +102,9 @@ def _profile_worker(
         optimizer.zero_grad()
         # torch.cuda.synchronize()
         t1 = time.perf_counter()
+
+        if step < WARMUP_STEPS:
+            continue
 
         grad_norm = _compute_grad_norm(model)
         peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
@@ -187,8 +191,8 @@ def main():
         all_results[label] = run_profile(label, config, world_size)
 
         stats = all_results[label]
-        avg_time = sum(s["step_time_ms"] for s in stats[10:]) / len(stats[10:])
-        avg_mem = sum(s["memory_mb"] for s in stats[10:]) / len(stats[10:])
+        avg_time = sum(s["step_time_ms"] for s in stats) / len(stats)
+        avg_mem = sum(s["memory_mb"] for s in stats) / len(stats)
         print(f"  Avg step time (after warmup): {avg_time:.1f} ms")
         print(f"  Avg peak memory: {avg_mem:.1f} MB")
         print(f"  Final loss: {stats[-1]['loss']:.4f}")
