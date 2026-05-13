@@ -8,6 +8,7 @@ from initialize import get_tp_group, get_tp_rank, get_tp_world_size, init_weight
 
 def _all_gather(input_: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
     """AllGather along dim=0: [s/n, b, h] -> [s, b, h]."""
+
     world_size = dist.get_world_size(group)
     if world_size == 1:
         return input_
@@ -22,6 +23,7 @@ def _all_gather(input_: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
 
 def _reduce_scatter(input_: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
     """ReduceScatter along dim=0: [s, b, h] -> [s/n, b, h]."""
+
     world_size = dist.get_world_size(group)
     if world_size == 1:
         return input_
@@ -87,123 +89,117 @@ class _RowParallelLinearFn(torch.autograd.Function):
         return grad_input, grad_weight, None
 
 
-def _ag_gemm_overlap(local_input, weight, group, matmul_fn=None):
+def _ag_gemm_overlap(local_input, weight, group):
     """AllGather + GEMM overlap via ring P2P exchange.
 
-    Returns (gemm_output [s, b, out_dim], gathered_input [s, b, h]).
+    Args:
+        local_input: This rank's input shard, shape [s/n, b, h].
+        weight: Weight matrix for F.linear.
+        group: TP process group.
+
+    Notes:
+        Each iteration: wait prev P2P -> dispatch next P2P -> GEMM.
+        NCCL P2P runs on internal high-priority stream, overlapping with GEMM.
+
+    Returns:
+        Tuple of (gemm_output, gathered_input):
+            gemm_output: [s, b, out_dim], chunks ordered by rank.
+            gathered_input: [s, b, h], the full AllGathered input.
     """
-    if matmul_fn is None:
-        matmul_fn = F.linear
 
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
 
     if world_size == 1:
-        return matmul_fn(local_input, weight), local_input
+        return F.linear(local_input, weight), local_input
 
     input_chunks: list[torch.Tensor | None] = [None] * world_size
     output_chunks: list[torch.Tensor | None] = [None] * world_size
-    input_chunks[rank] = local_input
     next_rank = (rank + 1) % world_size
     prev_rank = (rank - 1) % world_size
 
     recv_bufs = [torch.empty_like(local_input), torch.empty_like(local_input)]
-    comp_stream = torch.cuda.current_stream()
-    comm_stream = torch.cuda.Stream()
+    recv_bufs[-1].copy_(local_input)
+    reqs = []
 
-    output_chunks[rank] = matmul_fn(local_input, weight)
-    gemm_done = torch.cuda.Event()
-    gemm_done.record(comp_stream)
-
-    with torch.cuda.stream(comm_stream):
-        comm_stream.wait_event(gemm_done)
-        ops = [
-            dist.P2POp(dist.isend, local_input.contiguous(), next_rank, group),
-            dist.P2POp(dist.irecv, recv_bufs[0], prev_rank, group),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
+    for step in range(world_size):
+        # 1. Wait for previous round's P2P
         for r in reqs:
             r.wait()
-    comm_done = torch.cuda.Event()
-    comm_done.record(comm_stream)
 
-    for step in range(1, world_size):
-        cur_buf_idx = (step - 1) % 2
-        next_buf_idx = step % 2
-        comp_stream.wait_event(comm_done)
-
-        src_rank = (rank - step) % world_size
-        input_chunks[src_rank] = recv_bufs[cur_buf_idx].clone()
-
-        output_chunks[src_rank] = matmul_fn(input_chunks[src_rank], weight)
-        gemm_done = torch.cuda.Event()
-        gemm_done.record(comp_stream)
-
+        # 2. Dispatch this round's P2P (except last step)
+        send_buf = recv_bufs[(step - 1) % 2]
+        recv_buf = recv_bufs[step % 2]
         if step < world_size - 1:
-            with torch.cuda.stream(comm_stream):
-                comm_stream.wait_event(gemm_done)
-                ops = [
-                    dist.P2POp(
-                        dist.isend,
-                        input_chunks[src_rank].contiguous(),
-                        next_rank,
-                        group,
-                    ),
-                    dist.P2POp(dist.irecv, recv_bufs[next_buf_idx], prev_rank, group),
+            reqs = dist.batch_isend_irecv(
+                [
+                    dist.P2POp(dist.irecv, recv_buf, prev_rank, group),
+                    dist.P2POp(dist.isend, send_buf, next_rank, group),
                 ]
-                reqs = dist.batch_isend_irecv(ops)
-                for r in reqs:
-                    r.wait()
-            comm_done = torch.cuda.Event()
-            comm_done.record(comm_stream)
+            )
+
+        # 3. GEMM on current chunk (overlaps with P2P above)
+        src_rank = (rank - step) % world_size
+        input_chunks[src_rank] = send_buf.clone()
+        output_chunks[src_rank] = F.linear(input_chunks[src_rank], weight)
 
     gemm_output = torch.cat(output_chunks, dim=0)
     gathered_input = torch.cat([input_chunks[i] for i in range(world_size)], dim=0)
     return gemm_output, gathered_input
 
 
-def _gemm_rs_overlap(input_, weight, group, num_chunks=None, matmul_fn=None):
-    """GEMM + ReduceScatter overlap via chunked pipelining.
+def _gemm_rs_overlap(input_, weight, group):
+    """GEMM + ReduceScatter overlap.
 
-    Splits input into world_size chunks along dim=0. For chunk i, GEMM produces
-    the partial result for rank i's output portion, then dist.reduce sends the
-    sum to rank i. This ensures the scatter pattern matches the global ReduceScatter.
+    Args:
+        input_: Full input tensor, shape [s, b, h_in].
+        weight: Weight matrix for F.linear.
+        group: TP process group.
 
-    Returns output [s/n, b, h_out].
+    Notes:
+        Overlap flow: GEMM_i → wait reduce_{i-1} → dispatch reduce_i → GEMM_{i+1} → ...
+        So GEMM_{i+1} and reduce_i run in parallel on compute stream and NCCL stream.
+
+    Warnings:
+        prev_out keeps the previous gemm_out tensor alive during its async reduce.
+        Without it, Python refcount GC would free the buffer when gemm_out is
+        reassigned, while NCCL is still reading from it.
+
+    Returns:
+        This rank's output portion, shape [s/n, b, h_out].
+
     """
-    if matmul_fn is None:
-        matmul_fn = F.linear
 
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
     if world_size == 1:
-        return matmul_fn(input_, weight)
+        return F.linear(input_, weight)
 
     input_chunks = input_.chunk(world_size, dim=0)
-    my_output = None
-    gemm_outs = []  # keep all gemm_out tensors alive until comm finishes
-
-    comp_stream = torch.cuda.current_stream()
-    comm_stream = torch.cuda.Stream()
+    my_output: torch.Tensor | None = None
+    req: dist.Work | None = None
+    prev_out: torch.Tensor | None = None
 
     for i, inp_chunk in enumerate(input_chunks):
-        gemm_out = matmul_fn(inp_chunk, weight)
-        gemm_outs.append(gemm_out)
-        gemm_done = torch.cuda.Event()
-        gemm_done.record(comp_stream)
+        # GEMM (overlaps with previous chunk's reduce on NCCL stream)
+        gemm_out = F.linear(inp_chunk, weight)
 
-        with torch.cuda.stream(comm_stream):
-            comm_stream.wait_event(gemm_done)
-            dist.reduce(gemm_out, dst=i, group=group)
+        # Wait for previous reduce before dispatching new one
+        if req is not None:
+            req.wait()
+            prev_out = None
+
+        # Dispatch this chunk's reduce
+        req = dist.reduce(gemm_out, dst=i, group=group, async_op=True)
+        prev_out = gemm_out
 
         if i == rank:
             my_output = gemm_out
 
-    comm_event = torch.cuda.Event()
-    comm_event.record(comm_stream)
-    comp_stream.wait_event(comm_event)
+    # Wait for last reduce
+    if req is not None:
+        req.wait()
 
-    del gemm_outs
     return my_output
 
 
@@ -219,12 +215,7 @@ class _ColumnParallelOverlapFn(torch.autograd.Function):
     def backward(ctx, grad_output):
         full_input, weight = ctx.saved_tensors
         group = ctx.group
-
-        def dx_matmul(chunk, w):
-            return chunk.matmul(w)
-
-        grad_input = _gemm_rs_overlap(grad_output, weight, group, matmul_fn=dx_matmul)
-
+        grad_input = _gemm_rs_overlap(grad_output, weight.t(), group)
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
         full_input_2d = full_input.reshape(-1, full_input.shape[-1])
         grad_weight = grad_output_2d.t().matmul(full_input_2d)
@@ -244,17 +235,7 @@ class _RowParallelOverlapFn(torch.autograd.Function):
     def backward(ctx, grad_output):
         input_, weight = ctx.saved_tensors
         group = ctx.group
-
-        def dx_matmul(chunk, w):
-            return chunk.matmul(w)
-
-        grad_input, grad_full = _ag_gemm_overlap(
-            grad_output,
-            weight,
-            group,
-            matmul_fn=dx_matmul,
-        )
-
+        grad_input, grad_full = _ag_gemm_overlap(grad_output, weight.t(), group)
         grad_full_2d = grad_full.reshape(-1, grad_full.shape[-1])
         input_2d = input_.reshape(-1, input_.shape[-1])
         grad_weight = grad_full_2d.t().matmul(input_2d)
